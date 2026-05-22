@@ -55,6 +55,9 @@ export const mcpConfigurationSection = 'mcp';
 export const mcpDiscoverySection = 'chat.mcp.discovery.enabled';
 export const mcpServerSamplingSection = 'chat.mcp.serverSampling';
 export const mcpServerCollisionBehaviorSection = 'chat.mcp.collisionBehavior';
+export const mcpEnterpriseManagedAuthIssuerSection = 'mcp.enterpriseManagedAuth.issuer';
+export const mcpEnterpriseManagedAuthClientIdSection = 'mcp.enterpriseManagedAuth.clientId';
+export const mcpEnterpriseManagedAuthClientSecretSection = 'mcp.enterpriseManagedAuth.clientSecret';
 
 export const enum McpCollisionBehavior {
 	Disable = 'disable',
@@ -280,7 +283,12 @@ export const mcpServerSchema: IJSONSchema = {
 									clientId: {
 										type: 'string',
 										minLength: 1,
-										markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. To set the matching client secret securely, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+										markdownDescription: localize('app.mcp.json.oauth.clientId', "The OAuth client ID to use when authenticating with the server. When `enterpriseManaged` is `true`, this is the **resource** authorization server's client ID (the client trusted by the protected resource), not the IdP's. To set the matching client secret, use the *Set Client Secret* code lens above this field — secrets are stored in the OS secret store, not in this file.")
+									},
+									enterpriseManaged: {
+										type: 'boolean',
+										default: false,
+										markdownDescription: localize('app.mcp.json.oauth.enterpriseManaged', "(Preview) When set to `true`, this MCP server authenticates through the SSO issuer configured by `#mcp.enterpriseManagedAuth.issuer#` using OAuth Identity Assertion Authorization Grant (ID-JAG). After a one-time sign-in, subsequent enterprise-managed servers connect silently. The IdP client credentials are configured via `#mcp.enterpriseManagedAuth.clientId#` / `#mcp.enterpriseManagedAuth.clientSecret#`; the `clientId` on this server entry is passed to the resource authorization server.")
 									}
 								}
 							},

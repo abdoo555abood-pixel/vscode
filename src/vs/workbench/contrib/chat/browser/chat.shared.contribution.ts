@@ -38,7 +38,7 @@ import { IEditorResolverService, RegisteredEditorPriority } from '../../../servi
 import { IPathService } from '../../../services/path/common/pathService.js';
 import { IViewsService } from '../../../services/views/common/viewsService.js';
 import { AddConfigurationType, AssistedTypes } from '../../mcp/browser/mcpCommandsAddConfiguration.js';
-import { allDiscoverySources, discoverySourceSettingsLabel, McpCollisionBehavior, mcpDiscoverySection, mcpServerCollisionBehaviorSection, mcpServerSamplingSection } from '../../mcp/common/mcpConfiguration.js';
+import { allDiscoverySources, discoverySourceSettingsLabel, McpCollisionBehavior, mcpDiscoverySection, mcpEnterpriseManagedAuthClientIdSection, mcpEnterpriseManagedAuthClientSecretSection, mcpEnterpriseManagedAuthIssuerSection, mcpServerCollisionBehaviorSection, mcpServerSamplingSection } from '../../mcp/common/mcpConfiguration.js';
 import { ChatAgentNameService, ChatAgentService, IChatAgentNameService, IChatAgentService } from '../common/participants/chatAgents.js';
 import { CodeMapperService, ICodeMapperService } from '../common/editing/chatCodeMapperService.js';
 import '../common/widget/chatColors.js';
@@ -782,6 +782,28 @@ configurationRegistry.registerConfiguration({
 			description: nls.localize('chat.mcp.ui.enabled', "Controls whether MCP servers can provide custom UI for tool invocations."),
 			default: true,
 			tags: ['experimental'],
+		},
+		[mcpEnterpriseManagedAuthIssuerSection]: {
+			type: 'string',
+			format: 'uri',
+			default: '',
+			scope: ConfigurationScope.APPLICATION,
+			tags: ['preview'],
+			markdownDescription: nls.localize('mcp.enterpriseManagedAuth.issuer', "(Preview) The OAuth/OIDC issuer URL used for enterprise-managed Model Context Protocol (MCP) server authentication. When set, MCP servers configured with `oauth.enterpriseManaged: true` obtain access tokens through OAuth Identity Assertion Authorization Grant (ID-JAG) against this issuer. Must be an `https://` URL."),
+		},
+		[mcpEnterpriseManagedAuthClientIdSection]: {
+			type: 'string',
+			default: '',
+			scope: ConfigurationScope.APPLICATION,
+			tags: ['preview'],
+			markdownDescription: nls.localize('mcp.enterpriseManagedAuth.clientId', "(Preview) The OAuth client ID registered with the SSO issuer (`#mcp.enterpriseManagedAuth.issuer#`) for this device. Required for enterprise-managed MCP server authentication."),
+		},
+		[mcpEnterpriseManagedAuthClientSecretSection]: {
+			type: 'string',
+			default: '',
+			scope: ConfigurationScope.APPLICATION,
+			tags: ['preview'],
+			markdownDescription: nls.localize('mcp.enterpriseManagedAuth.clientSecret', "(Preview) The OAuth client secret paired with `#mcp.enterpriseManagedAuth.clientId#`. Avoid checking secrets into source control; this field is intended for local development against test environments."),
 		},
 		[mcpServerCollisionBehaviorSection]: {
 			type: 'string',

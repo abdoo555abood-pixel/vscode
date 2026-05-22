@@ -1,0 +1,298 @@
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+import type * as vscode from 'vscode';
+import { URI } from '../../../base/common/uri.js';
+import { stringHash } from '../../../base/common/hash.js';
+import { buildIdJagExchangeBody, buildResourceRedemptionBody, fetchAuthorizationServerMetadata, getClaimsFromJWT, IAuthorizationJWTClaims, IAuthorizationTokenResponse, isAuthorizationTokenResponse } from '../../../base/common/oauth.js';
+import { DynamicAuthProvider } from './extHostAuthentication.js';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Ctor<T> = new (...args: any[]) => T;
+
+/**
+ * Scopes used when bootstrapping the IdP session for an XAA flow.
+ *
+ * `openid` is required because the ID-JAG token exchange uses the IdP-issued
+ * `id_token` as `subject_token` (per draft-ietf-oauth-identity-assertion-authz-grant
+ * section 3.1, the subject token MUST be of type `urn:ietf:params:oauth:token-type:id_token`).
+ * `offline_access` is requested so we get a refresh token for the IdP session.
+ */
+export const IDP_SCOPES: readonly string[] = ['openid', 'offline_access'];
+
+interface IResourceCacheEntry {
+	readonly resource: string;
+	readonly scopes: readonly string[];
+	readonly token: IAuthorizationTokenResponse;
+	readonly created_at: number;
+}
+
+/** Cache key for resource-scoped tokens. Exported for testing. */
+export function cacheKey(resource: string, scopes: readonly string[]): string {
+	return resource + '|' + [...scopes].sort().join(' ');
+}
+
+/**
+ * Returns true if the cached token is past (or within 60s of) its expiry. Pure
+ * and exported for testing.
+ */
+export function isExpired(entry: { token: { expires_in?: number }; created_at: number }, now: number = Date.now()): boolean {
+	if (!entry.token.expires_in) {
+		return false;
+	}
+	return now > entry.created_at + (entry.token.expires_in * 1000) - 60_000;
+}
+
+/**
+ * (Preview) Mixin that turns a {@link DynamicAuthProvider} subclass into a
+ * Cross App Access (XAA) / enterprise-managed authentication provider, per
+ * `draft-ietf-oauth-identity-assertion-authz-grant`.
+ *
+ * The IdP login leg is identical to the base class — Auth Code + PKCE against
+ * the org-configured issuer, using the pre-registered client credentials. On
+ * top of that:
+ *
+ *   1. `createSession` ensures an IdP session exists (delegated to the base
+ *      class with {@link IDP_SCOPES}).
+ *   2. It POSTs to the IdP token endpoint with `grant_type=token-exchange`,
+ *      `subject_token=<id_token>`, `subject_token_type=id_token`,
+ *      `requested_token_type=id-jag`, `audience=<resource AS>`,
+ *      `resource=<resource indicator>`, `scope=<requested scopes>` to mint an
+ *      ID-JAG.
+ *   3. It discovers the resource's authorization server metadata (the audience
+ *      URL) and POSTs the ID-JAG to its token endpoint with
+ *      `grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer`,
+ *      `assertion=<id-jag>`, `resource=<resource indicator>`,
+ *      `scope=<requested scopes>` to obtain a resource-scoped access token.
+ *   4. The resource-scoped token is cached in-memory per `(resource, scopes)`
+ *      and returned as the session's access token.
+ *
+ * The resource indicator is read from `options.resource` (RFC 8707) and the
+ * resource's authorization server URL from `options.audience` on
+ * {@link vscode.AuthenticationProviderSessionOptions}.
+ */
+export function XaaifyAuthProvider<TBase extends Ctor<DynamicAuthProvider>>(Base: TBase): TBase {
+	return class XaaAuthenticationProvider extends Base {
+		private readonly _resourceTokens = new Map<string, IResourceCacheEntry>();
+		/** Per-resource-client-id client secrets. Lazily populated via the main-thread prompt. */
+		private readonly _resourceClientSecrets = new Map<string, string | undefined>();
+
+		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		constructor(...args: any[]) {
+			super(...args);
+			// Seventh positional argument is the authorization server URI.
+			// (extHostWindow, extHostUrls, initData, extHostProgress, loggerService, proxy, authorizationServer, ...)
+			const issuer = args[6] as URI;
+			this.id = `xaa:${issuer.toString(true)}`;
+			this._logger.trace(`[XAA] Provider constructed for issuer ${issuer.toString(true)}. authorization_endpoint=${this._serverMetadata.authorization_endpoint}, token_endpoint=${this._serverMetadata.token_endpoint}`);
+		}
+
+		override async getSessions(scopes: readonly string[] | undefined, options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession[]> {
+			const resource = options.resource;
+			if (!resource || !scopes) {
+				return [];
+			}
+			const key = cacheKey(resource, scopes);
+			const entry = this._resourceTokens.get(key);
+			if (!entry) {
+				return [];
+			}
+			if (isExpired(entry)) {
+				this._resourceTokens.delete(key);
+				return [];
+			}
+			return [toSession(entry.token, entry.scopes)];
+		}
+
+		override async createSession(scopes: string[], options: vscode.AuthenticationProviderSessionOptions): Promise<vscode.AuthenticationSession> {
+			const audience = options.audience;
+			const resource = options.resource;
+			this._logger.trace(`[XAA] createSession scopes=[${scopes.join(' ')}] audience=${audience} resource=${resource}`);
+			if (!audience) {
+				throw new Error('Enterprise-managed authentication requires `options.audience` (the resource\'s authorization server URL) but none was provided.');
+			}
+			if (!resource) {
+				throw new Error('Enterprise-managed authentication requires `options.resource` (the resource indicator / MCP server URL) but none was provided.');
+			}
+
+			// 1. Ensure IdP session via the base class. Don't pass the XAA options through —
+			//    the IdP login leg is unrelated to the resource/audience, and the base provider
+			//    would otherwise look for cached tokens scoped by a foreign audience.
+			const idpSession = await this._ensureIdpSession();
+			if (!idpSession.idToken) {
+				throw new Error('IdP session is missing an id_token; the issuer must support OpenID Connect and the `openid` scope.');
+			}
+
+			// 2. Exchange the IdP id_token for an ID-JAG.
+			const jag = await this._exchangeForIdJag(idpSession.idToken, audience, resource, scopes);
+
+			// 3. Discover the resource AS token endpoint. `audience` IS the resource AS URL.
+			const resourceTokenEndpoint = await this._discoverResourceTokenEndpoint(audience);
+
+			// 4. Redeem the ID-JAG at the resource AS for a resource-scoped access token.
+			//    Per draft-ietf-oauth-identity-assertion-authz-grant section 3.2, the ID-JAG carries a
+			//    `client_id` claim identifying the requesting app to the resource AS. This is
+			//    often distinct from the IdP `client_id` (xaa.dev for example uses a
+			//    `{idp_client_id}-at-{resource}` form), so we extract it from the assertion
+			//    rather than reusing `this._clientId`. Caller-supplied `options.clientId`
+			//    (from the MCP server's `oauth.clientId` config) takes precedence over the
+			//    JAG-extracted value.
+			let resourceClientId = this._clientId;
+			let resourceClientIdFromJag = false;
+			const configuredResourceClientId = typeof options.clientId === 'string' && options.clientId.length > 0 ? options.clientId : undefined;
+			if (configuredResourceClientId) {
+				resourceClientId = configuredResourceClientId;
+				resourceClientIdFromJag = resourceClientId !== this._clientId;
+			} else {
+				try {
+					const jagClaims = getClaimsFromJWT(jag);
+					if (typeof jagClaims.client_id === 'string' && jagClaims.client_id.length > 0) {
+						resourceClientId = jagClaims.client_id;
+						resourceClientIdFromJag = resourceClientId !== this._clientId;
+					}
+				} catch (err) {
+					this._logger.warn(`[XAA] Could not decode ID-JAG to read resource client_id; falling back to IdP client_id. Error: ${(err as Error).message}`);
+				}
+			}
+
+			// If the resource AS uses a distinct client_id (xaa.dev's "{client}-at-{resource}" pattern),
+			// it will reject `this._clientSecret` (the IdP secret) with `invalid_client`. The caller may
+			// supply the resource secret directly via `options.clientSecret` (resolved from secret storage
+			// in `mainThreadMcp` via the "Set Client Secret" code lens above `oauth.clientId` in mcp.json);
+			// otherwise we fall back to a cached per-resource secret or prompt the user for one. We pass
+			// `undefined` if the user leaves the prompt blank — that's valid for clients registered with
+			// `token_endpoint_auth_method=none`.
+			let resourceClientSecret: string | undefined = this._clientSecret;
+			const configuredResourceClientSecret = typeof options.clientSecret === 'string' && options.clientSecret.length > 0 ? options.clientSecret : undefined;
+			if (configuredResourceClientSecret) {
+				resourceClientSecret = configuredResourceClientSecret;
+				this._resourceClientSecrets.set(resourceClientId, configuredResourceClientSecret);
+			} else if (resourceClientIdFromJag) {
+				if (this._resourceClientSecrets.has(resourceClientId)) {
+					resourceClientSecret = this._resourceClientSecrets.get(resourceClientId);
+				} else {
+					this._logger.info(`[XAA] Resource AS requires a distinct client_id '${resourceClientId}' — prompting for matching client_secret.`);
+					const promptedSecret = await this._proxy.$promptForResourceClientSecret(resourceClientId, resource);
+					this._resourceClientSecrets.set(resourceClientId, promptedSecret);
+					resourceClientSecret = promptedSecret;
+				}
+			}
+			const resourceToken = await this._redeemAtResource(resourceTokenEndpoint, jag, resource, scopes, resourceClientId, resourceClientSecret);
+
+			this._resourceTokens.set(cacheKey(resource, scopes), {
+				resource,
+				scopes,
+				token: resourceToken,
+				created_at: Date.now(),
+			});
+			return toSession(resourceToken, scopes);
+		}
+
+		private async _ensureIdpSession(): Promise<vscode.AuthenticationSession> {
+			this._logger.trace(`[XAA] _ensureIdpSession: scopes=[${IDP_SCOPES.join(' ')}] authorization_endpoint=${this._serverMetadata.authorization_endpoint}`);
+			const cleanOptions: vscode.AuthenticationProviderSessionOptions = {};
+			const existing = await super.getSessions(IDP_SCOPES as string[], cleanOptions);
+			if (existing.length && existing[0].idToken) {
+				this._logger.trace(`[XAA] _ensureIdpSession: reusing existing IdP session`);
+				return existing[0];
+			}
+			this._logger.trace(`[XAA] _ensureIdpSession: creating new IdP session via super.createSession`);
+			return super.createSession([...IDP_SCOPES], cleanOptions);
+		}
+
+		private async _exchangeForIdJag(idToken: string, audience: string, resource: string, scopes: string[]): Promise<string> {
+			const tokenEndpoint = this._serverMetadata.token_endpoint;
+			if (!tokenEndpoint) {
+				throw new Error('Issuer metadata is missing token_endpoint; cannot perform XAA token exchange.');
+			}
+			const body = buildIdJagExchangeBody(this._clientId, this._clientSecret, idToken, audience, resource, scopes);
+			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG exchange) audience=${audience} resource=${resource} scope=${scopes.join(' ')}`);
+			const response = await fetch(tokenEndpoint, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					'Accept': 'application/json',
+				},
+				body: body.toString(),
+			});
+			if (!response.ok) {
+				throw new Error(`XAA token exchange (IdP) failed: ${response.status} ${await safeText(response)}`);
+			}
+			const data: unknown = await response.json();
+			const issued = (data && typeof data === 'object' && typeof (data as { access_token?: unknown }).access_token === 'string')
+				? (data as { access_token: string }).access_token
+				: undefined;
+			if (!issued) {
+				throw new Error(`XAA token exchange (IdP) returned no access_token. Response: ${JSON.stringify(data)}`);
+			}
+			return issued;
+		}
+
+		private async _discoverResourceTokenEndpoint(audience: string): Promise<string> {
+			const { metadata, errors } = await fetchAuthorizationServerMetadata(audience);
+			if (!metadata?.token_endpoint) {
+				throw new Error(`Failed to discover resource authorization server metadata for '${audience}': ${errors.map(e => e.message).join('; ') || 'no token_endpoint in metadata'}`);
+			}
+			return metadata.token_endpoint;
+		}
+
+		private async _redeemAtResource(tokenEndpoint: string, idJag: string, resource: string, scopes: string[], resourceClientId: string, resourceClientSecret: string | undefined): Promise<IAuthorizationTokenResponse> {
+			const body = buildResourceRedemptionBody(resourceClientId, resourceClientSecret, idJag, resource, scopes);
+			this._logger.trace(`[XAA] POST ${tokenEndpoint} (ID-JAG redemption) client_id=${resourceClientId} resource=${resource} scope=${scopes.join(' ')}`);
+			const response = await fetch(tokenEndpoint, {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/x-www-form-urlencoded',
+					'Accept': 'application/json',
+				},
+				body: body.toString(),
+			});
+			if (!response.ok) {
+				throw new Error(`XAA token exchange (resource) failed: ${response.status} ${await safeText(response)}`);
+			}
+			const data = await response.json();
+			if (!isAuthorizationTokenResponse(data)) {
+				throw new Error(`XAA token exchange (resource) returned an invalid token response: ${JSON.stringify(data)}`);
+			}
+			return data;
+		}
+	};
+}
+
+function toSession(token: IAuthorizationTokenResponse, scopes: readonly string[]): vscode.AuthenticationSession {
+	let claims: IAuthorizationJWTClaims | undefined;
+	if (token.id_token) {
+		try {
+			claims = getClaimsFromJWT(token.id_token);
+		} catch {
+			// ignore
+		}
+	}
+	if (!claims) {
+		try {
+			claims = getClaimsFromJWT(token.access_token);
+		} catch {
+			// ignore
+		}
+	}
+	return {
+		id: stringHash(token.access_token, 0).toString(),
+		accessToken: token.access_token,
+		account: {
+			id: claims?.sub || 'unknown',
+			label: claims?.preferred_username || claims?.name || claims?.email || 'XAA',
+		},
+		scopes: [...scopes],
+		idToken: token.id_token,
+	};
+}
+
+async function safeText(response: Response): Promise<string> {
+	try {
+		return await response.text();
+	} catch {
+		return response.statusText;
+	}
+}
